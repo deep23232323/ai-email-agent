@@ -6,25 +6,13 @@ from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 from pydantic import BaseModel, Field
+from send_email import send_mail
 
 load_dotenv()
 
-
-def _should_interrupt():
-    return os.getenv("EMAIL_AGENT_INTERACTIVE", "false").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _safe_interrupt(payload):
-    if not _should_interrupt():
-        return "yes"
-
-    try:
-        from langgraph.types import interrupt
-
-        return interrupt(payload)
-    except Exception:
-        return "yes"
+MAX_FEEDBACK_ROUNDS = 3
 
 
 class EmailState(BaseModel):
@@ -142,10 +130,12 @@ def draft_node(state: EmailState) -> EmailState:
     Recipient: {state.recipient_name}
     Recipient Email: {state.recipient_email}
     Reason: {state.mail_reason}
+    Feedback on the previous draft: {state.feedback or "None"}
 
     Subject should be concise.
     Body should be under 200 words.
     Include greetings and a professional closing.
+    Apply the user's feedback when revising the previous draft.
     """
 
     if llm is not None:
@@ -172,20 +162,57 @@ def review_node(state: EmailState) -> EmailState:
     print("Body:", _safe_print(state.body))
     print("-" * 50)
 
-    response = _safe_interrupt({
-        "message": "Do you want to approve this email?",
+    response = interrupt({
+        "message": "Approve this email or provide feedback for a revision.",
         "subject": state.subject,
         "body": state.body,
-        "options": ["yes", "provide feedback"],
+        "options": ["approve", "provide feedback"],
     })
 
     if isinstance(response, dict):
-        response = response.get("response") or response.get("decision") or "yes"
+        if (
+            response.get("approved") is True
+            or response.get("positive") is True
+            or response.get("decision") is True
+        ):
+            response = "approve"
+        else:
+            response = (
+                response.get("response")
+                or response.get("decision")
+                or response.get("feedback")
+                or ""
+            )
 
-    if str(response).strip().lower() in {"yes", "approve", "approved"}:
+    normalized_response = re.sub(r"[^\w\s]", "", str(response)).strip().lower()
+    if normalized_response in {
+        "true",
+        "yes",
+        "y",
+        "approve",
+        "i approve",
+        "approved",
+        "positive",
+        "positive feedback",
+        "send",
+        "send it",
+        "yes send it",
+        "approved send",
+        "looks good",
+        "looks good to me",
+        "this looks good",
+        "this is good",
+        "thats good",
+        "looks great",
+        "this looks great",
+        "great",
+        "perfect",
+        "i like it",
+        "lgtm",
+    }:
         state.feedback = ""
     else:
-        state.feedback = str(response).strip() or "provide feedback"
+        state.feedback = str(response).strip() or "Please revise the draft."
         state.feedback_count += 1
 
     return state
@@ -195,20 +222,21 @@ def router(state: EmailState) -> Literal["draft", "send", "cancel"]:
     if not state.feedback.strip():
         return "send"
 
-    if state.feedback_count >= 3:
+    if state.feedback_count > MAX_FEEDBACK_ROUNDS:
         return "cancel"
 
     return "draft"
 
 
 def cancel_node(state: EmailState) -> EmailState:
-    state.response = "Email Not sent, because you have reached the feedback limit."
+    state.response = "Email not sent because you exceeded the 3-feedback limit."
     return state
 
 
 def send_node(state: EmailState) -> EmailState:
     "Send final email"
-    state.response = "Email Sent Successfully"
+    res = send_mail(state.recipient_name, state.subject, state.body)
+    state.response = res
     return state
 
 
